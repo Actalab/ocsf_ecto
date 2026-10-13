@@ -153,6 +153,7 @@
                  [:Repo],
                  [:SinkTest],
                  [:SinkRepoOverrideTest],
+                 [:SinkResilienceTest],
                  [:EventTest],
                  [:EventJsonTest],
                  [:EventJsonConformanceTest],

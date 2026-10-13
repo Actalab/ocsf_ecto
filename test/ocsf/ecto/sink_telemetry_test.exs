@@ -62,11 +62,31 @@ defmodule OCSF.Ecto.SinkTelemetryTest do
   describe "write/1 telemetry — error path" do
     # async: false + DataCase shares the sandbox, so spawning a caller
     # without ownership (the trick used in `sink_test.exs`) is not
-    # available here. Instead, pass a non-event struct so `row_for/1`
-    # fails its pattern match and the Sink's rescue clause converts
-    # the raise into `{:error, _}`.
+    # available here. Instead, point the sink at a Repo whose
+    # `insert_all/3` raises, as a database that is down does: the Sink's
+    # rescue clause converts the raise into `{:error, _}`. (A non-event is
+    # no longer one: it is rejected on its own, see SinkResilienceTest.)
+    defmodule DownRepo do
+      def __adapter__, do: Ecto.Adapters.Postgres
+
+      def insert_all(_schema, _rows, _opts),
+        do: raise(DBConnection.ConnectionError, "connection refused")
+    end
+
+    setup do
+      original = Application.fetch_env(:ocsf_ecto, :repo)
+      Application.put_env(:ocsf_ecto, :repo, DownRepo)
+
+      on_exit(fn ->
+        case original do
+          {:ok, repo} -> Application.put_env(:ocsf_ecto, :repo, repo)
+          :error -> Application.delete_env(:ocsf_ecto, :repo)
+        end
+      end)
+    end
+
     test "emits :stop with result: :error when the write fails" do
-      assert {:error, %FunctionClauseError{}} = Sink.write([%{not_an_event: true}])
+      assert {:error, %DBConnection.ConnectionError{}} = Sink.write([build_event()])
 
       assert_receive {:telemetry, [:ocsf_ecto, :sink, :write, :stop], _, %{result: :error}}
     end

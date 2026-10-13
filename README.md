@@ -248,6 +248,27 @@ Metadata is intentionally event-payload-free — batch `:count` is a
 coarse signal; correlate with the core `[:ocsf, :event, :new]`
 stream for per-event detail.
 
+### One bad row never fails the batch
+
+A single row Postgres refuses would fail the whole `insert_all/3`, and
+a pipeline retrying that batch would never get past it. So
+`write/1`:
+
+- **coerces** values OCSF allows but the columns can't take: `time`
+  padded to microsecond precision, a string IP parsed (dropped if it
+  doesn't parse), a non-UUID `user.uid` / `metadata.correlation_uid`
+  moved to `unmapped` under its OCSF path;
+- **drops** a row that still can't be stored (checked through the
+  adapter's dumpers: a non-UUID `metadata.uid`, a value the column type
+  refuses, an encryption failure), writes the rest, and counts it:
+
+| Event                              | Measurements | Metadata                                                        |
+|------------------------------------|--------------|-----------------------------------------------------------------|
+| `[:ocsf_ecto, :sink, :rejected]`   | `%{count}`   | `:sink`, `:reason` (`:invalid_field` \| `:invalid_event`), `:field` |
+
+`{:error, _}` is left for failures of the write itself (the database
+is down, a timeout), which a retry can fix.
+
 Attach a module-based handler (never an anonymous function — the
 `:telemetry` library warns about performance):
 

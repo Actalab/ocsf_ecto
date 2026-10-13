@@ -46,6 +46,12 @@ defmodule OCSF.Ecto.Sink do
   is a coarse observability signal; emitters should correlate with
   the core `[:ocsf, :event, :new]` stream for per-event detail.
 
+  `[:ocsf_ecto, :sink, :rejected]` (`%{count: 1}` /
+  `%{sink, reason, field}`) counts each event dropped because its row can
+  never be stored: `reason` is `:invalid_field` (`field` names the column
+  whose type refused the value) or `:invalid_event` (`field` is `nil`: the
+  row could not be built at all).
+
   See `OCSF.Ecto.Event`, `OCSF.Ecto.Repo`.
   """
 
@@ -72,6 +78,15 @@ defmodule OCSF.Ecto.Sink do
 
   Returns `:ok` when the insert succeeds (even if no new rows were
   written due to conflict), or `{:error, exception}` on failure.
+
+  One bad row never fails the batch. Values OCSF allows but a column
+  can't take are coerced (see `row_for/1`). A row that still can't be
+  stored is checked through the adapter's dumpers before the insert,
+  dropped, and counted on `[:ocsf_ecto, :sink, :rejected]`; the rest is
+  written. Typical cases are a `metadata.uid` that isn't a UUID, a value
+  the column type refuses, or an encryption failure. `{:error, _}` is
+  left for failures of the write itself, such as the database being
+  down, which are worth retrying.
 
   Emits `:telemetry` events under `[:ocsf_ecto, :sink, :write]` —
   see the module docs for the full event table.
@@ -101,13 +116,60 @@ defmodule OCSF.Ecto.Sink do
   end
 
   defp do_write(events) do
-    rows = Enum.map(events, &row_for/1)
+    events
+    |> Enum.flat_map(&storable_row/1)
+    |> insert()
+  end
 
+  defp insert([]), do: :ok
+
+  defp insert(rows) do
     case repo().insert_all(EctoEvent, rows, on_conflict: :nothing, conflict_target: :id) do
       {_count, _} -> :ok
     end
   rescue
     error -> {:error, error}
+  end
+
+  # One row the table can never take fails the whole `insert_all/3`, so the
+  # batch with it, on every retry. Each row is first dumped through the
+  # schema's column types: one that does not dump is dropped and counted on
+  # `[:ocsf_ecto, :sink, :rejected]`, and the rest of the batch is written.
+  defp storable_row(event) do
+    row = row_for(event)
+
+    case undumpable_field(repo().__adapter__(), row) do
+      nil -> [row]
+      field -> rejected(:invalid_field, field)
+    end
+  rescue
+    _error -> rejected(:invalid_event, nil)
+  end
+
+  # Through the adapter's dumpers, as `insert_all/3` does: `:binary_id` is
+  # only checked to be a UUID there.
+  defp undumpable_field(adapter, row) do
+    Enum.find_value(row, fn {field, value} ->
+      if dumps?(adapter, EctoEvent.__schema__(:type, field), value), do: nil, else: field
+    end)
+  end
+
+  defp dumps?(_adapter, _type, nil), do: true
+
+  defp dumps?(adapter, type, value) do
+    match?({:ok, _}, Ecto.Type.adapter_dump(adapter, type, value))
+  rescue
+    _error -> false
+  end
+
+  defp rejected(reason, field) do
+    :telemetry.execute([:ocsf_ecto, :sink, :rejected], %{count: 1}, %{
+      sink: __MODULE__,
+      reason: reason,
+      field: field
+    })
+
+    []
   end
 
   defp result_tag(:ok), do: :ok
@@ -120,6 +182,13 @@ defmodule OCSF.Ecto.Sink do
   the keyword-indexed map passed to `Ecto.Repo.insert_all/3`.
   Exposed for diagnostic and test use — prefer `write/1` in
   application code.
+
+  Values OCSF allows but the columns can't take as is are coerced:
+  `time` is padded to microsecond precision; an IP given as a string
+  is parsed, and dropped when it doesn't parse (the event is kept); a
+  `user.uid` or `metadata.correlation_uid` that is not a UUID moves to
+  `unmapped`, under its OCSF path (`"user.uid"`), instead of the
+  `binary_id` column.
 
   ## Examples
 
@@ -189,7 +258,51 @@ defmodule OCSF.Ecto.Sink do
       unmapped: redacted.unmapped || %{},
       inserted_at: now
     }
+    |> normalize()
   end
+
+  # Values OCSF allows but the columns can't take as is: coerced here, so
+  # they don't fail the row.
+  #
+  #   * `time` — `:utc_datetime_usec` requires a microsecond precision;
+  #   * IPs — `inet` columns take a tuple: a string is parsed, and one that
+  #     does not parse is dropped (the event is kept);
+  #   * `user.uid` / `metadata.correlation_uid` — any string in OCSF, a
+  #     `binary_id` column here: a value that is not a UUID moves to
+  #     `unmapped` under its OCSF path rather than being lost.
+  @uuid_columns [user__uid: "user.uid", metadata__correlation_uid: "metadata.correlation_uid"]
+
+  defp normalize(row) do
+    row
+    |> Map.update!(:time, &usec/1)
+    |> Map.update!(:src_endpoint__ip, &ip/1)
+    |> Map.update!(:dst_endpoint__ip, &ip/1)
+    |> unmap_non_uuids()
+  end
+
+  defp usec(%DateTime{microsecond: {us, _precision}} = time), do: %{time | microsecond: {us, 6}}
+  defp usec(time), do: time
+
+  defp ip(ip) when is_binary(ip) do
+    case :inet.parse_address(String.to_charlist(ip)) do
+      {:ok, address} -> address
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp ip(ip), do: ip
+
+  defp unmap_non_uuids(row) do
+    Enum.reduce(@uuid_columns, row, fn {column, path}, row ->
+      case uuid(row[column]) do
+        {:ok, uuid} -> %{row | column => uuid}
+        :error -> %{row | column => nil, unmapped: Map.put(row.unmapped, path, row[column])}
+      end
+    end)
+  end
+
+  defp uuid(nil), do: {:ok, nil}
+  defp uuid(value), do: Ecto.UUID.cast(value)
 
   @doc """
   Returns the `OCSF.Policy` applied to every write.
