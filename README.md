@@ -152,6 +152,12 @@ def up,   do: OCSF.Ecto.Migration.up(version: 2)
 def down, do: OCSF.Ecto.Migration.down(version: 2)
 ```
 
+| Version | Change                                                                 |
+|---------|------------------------------------------------------------------------|
+| 1       | `ocsf_event__logs` table and indexes                                   |
+| 2       | completeness columns (`jsonb` sub-objects, lists, `raw_data`)          |
+| 3       | `user__uid`, `metadata__correlation_uid` from `uuid` to `text` (OCSF types them as strings); `down` sets non-UUID values to `NULL` |
+
 Full DDL contract: see SPEC §11. The module is idempotent
 (`create_if_not_exists`) so re-running `up/0` is safe.
 
@@ -247,6 +253,29 @@ end
 Metadata is intentionally event-payload-free — batch `:count` is a
 coarse signal; correlate with the core `[:ocsf, :event, :new]`
 stream for per-event detail.
+
+### One bad row never fails the batch
+
+A single row Postgres refuses would fail the whole `insert_all/3`, and
+a pipeline retrying that batch would never get past it. So
+`write/1`:
+
+- **coerces** values OCSF allows but the columns can't take: `time`
+  padded to microsecond precision, a string IP parsed (dropped if it
+  doesn't parse);
+- when the batch insert still fails on a row (a non-UUID `metadata.uid`,
+  a value the column type refuses, a `NOT NULL` column left empty, an
+  `unmapped` term JSON can't encode), **retries it one row at a time**,
+  drops the faulty rows, writes the rest, and counts each drop:
+
+| Event                              | Measurements | Metadata                                                                  |
+|------------------------------------|--------------|---------------------------------------------------------------------------|
+| `[:ocsf_ecto, :sink, :rejected]`   | `%{count}`   | `:sink`, `:reason` (`:invalid_row` \| `:invalid_event`), `:error` (exception module) |
+
+`{:error, _}` is left for failures of the write itself (the database
+is down, a timeout, the vault failing), which a retry can fix. Inside
+a caller's transaction the insert runs under a savepoint, so a refused
+row doesn't abort that transaction.
 
 Attach a module-based handler (never an anonymous function — the
 `:telemetry` library warns about performance):

@@ -46,6 +46,12 @@ defmodule OCSF.Ecto.Sink do
   is a coarse observability signal; emitters should correlate with
   the core `[:ocsf, :event, :new]` stream for per-event detail.
 
+  `[:ocsf_ecto, :sink, :rejected]` (`%{count: 1}` /
+  `%{sink, reason, error}`) counts each event dropped because its row can
+  never be stored: `reason` is `:invalid_row` (`error` names the exception
+  module the insert raised, e.g. `Ecto.ChangeError`, `Postgrex.Error`) or
+  `:invalid_event` (`error` is `nil`: the row could not be built at all).
+
   See `OCSF.Ecto.Event`, `OCSF.Ecto.Repo`.
   """
 
@@ -72,6 +78,16 @@ defmodule OCSF.Ecto.Sink do
 
   Returns `:ok` when the insert succeeds (even if no new rows were
   written due to conflict), or `{:error, exception}` on failure.
+
+  One bad row never fails the batch. Values OCSF allows but a column
+  can't take are coerced (see `row_for/1`). When the batch insert still
+  fails on a row — a `metadata.uid` that isn't a UUID, a value the column
+  type refuses, a `NOT NULL` column left empty, an `unmapped` term JSON
+  can't encode — the batch is retried one row at a time: the faulty rows
+  are dropped and counted on `[:ocsf_ecto, :sink, :rejected]`, the rest is
+  written. `{:error, _}` is left for failures of the write itself, such
+  as the database being down or the vault failing, which are worth
+  retrying.
 
   Emits `:telemetry` events under `[:ocsf_ecto, :sink, :write]` —
   see the module docs for the full event table.
@@ -101,13 +117,91 @@ defmodule OCSF.Ecto.Sink do
   end
 
   defp do_write(events) do
-    rows = Enum.map(events, &row_for/1)
+    policy = policy()
 
-    case repo().insert_all(EctoEvent, rows, on_conflict: :nothing, conflict_target: :id) do
-      {_count, _} -> :ok
-    end
+    events
+    |> Enum.flat_map(&build_row(&1, policy))
+    |> insert()
+  end
+
+  # Building a row only reads the event: whatever it raises comes from the
+  # event, never from the environment (repo, policy, vault are outside).
+  defp build_row(%OCSF.Event{} = event, policy) do
+    [project(event, policy)]
   rescue
-    error -> {:error, error}
+    _error -> rejected(:invalid_event)
+  end
+
+  defp build_row(_not_an_event, _policy), do: rejected(:invalid_event)
+
+  # One row the table refuses fails the whole `insert_all/3`, so the batch
+  # with it, on every retry. When the batch fails on a row error, it is
+  # retried one row at a time: the faulty row is dropped and counted on
+  # `[:ocsf_ecto, :sink, :rejected]`, the rest is written. Rows written
+  # before the failure are no-ops the second time (`on_conflict: :nothing`).
+  defp insert([]), do: :ok
+
+  defp insert(rows) do
+    insert_all(rows)
+  rescue
+    error -> if row_error?(error), do: isolate(rows), else: {:error, error}
+  end
+
+  defp isolate(rows) do
+    Enum.reduce_while(rows, :ok, fn row, :ok ->
+      case insert_one(row) do
+        :ok -> {:cont, :ok}
+        {:error, _error} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp insert_one(row) do
+    insert_all([row])
+  rescue
+    error ->
+      if row_error?(error), do: rejected(:invalid_row, error), else: {:error, error}
+  end
+
+  # Inside a transaction, a statement Postgres refuses aborts it: the
+  # savepoint keeps the caller's transaction, and the isolation retries,
+  # usable.
+  defp insert_all(rows) do
+    repo = repo()
+    opts = [on_conflict: :nothing, conflict_target: :id]
+    opts = if repo.in_transaction?(), do: [mode: :savepoint] ++ opts, else: opts
+
+    {_count, _} = repo.insert_all(EctoEvent, rows, opts)
+    :ok
+  end
+
+  # Errors a row causes, and a retry of the same row never fixes. Anything
+  # else — the database down, a timeout, the vault failing — is the write's
+  # problem: `{:error, _}`, the batch is retried.
+  defp row_error?(%Ecto.ChangeError{}), do: true
+  defp row_error?(%Protocol.UndefinedError{protocol: Jason.Encoder}), do: true
+  defp row_error?(%Jason.EncodeError{}), do: true
+  # Postgres classes 22 (data exception) and 23 (integrity constraint).
+  defp row_error?(%Postgrex.Error{postgres: %{pg_code: "22" <> _}}), do: true
+  defp row_error?(%Postgrex.Error{postgres: %{pg_code: "23" <> _}}), do: true
+  defp row_error?(_error), do: false
+
+  defp rejected(:invalid_event) do
+    emit_rejected(:invalid_event, nil)
+    []
+  end
+
+  defp rejected(:invalid_row, error) do
+    emit_rejected(:invalid_row, error.__struct__)
+    :ok
+  end
+
+  defp emit_rejected(reason, error) do
+    :telemetry.execute([:ocsf_ecto, :sink, :rejected], %{count: 1}, %{
+      sink: __MODULE__,
+      reason: reason,
+      error: error
+    })
   end
 
   defp result_tag(:ok), do: :ok
@@ -121,6 +215,10 @@ defmodule OCSF.Ecto.Sink do
   Exposed for diagnostic and test use — prefer `write/1` in
   application code.
 
+  Values OCSF allows but the columns can't take as is are coerced:
+  `time` is padded to microsecond precision; an IP given as a string
+  is parsed, and dropped when it doesn't parse (the event is kept).
+
   ## Examples
 
       {:ok, event} =
@@ -133,8 +231,10 @@ defmodule OCSF.Ecto.Sink do
   """
   @impl true
   @spec row_for(OCSF.Event.t()) :: map
-  def row_for(%OCSF.Event{} = event) do
-    redacted = OCSF.Policy.apply(policy(), event)
+  def row_for(%OCSF.Event{} = event), do: project(event, policy())
+
+  defp project(event, policy) do
+    redacted = OCSF.Policy.apply(policy, event)
     now = DateTime.utc_now()
 
     # Serialized (label-rich, OCSF-shaped) view of the redacted event —
@@ -189,7 +289,33 @@ defmodule OCSF.Ecto.Sink do
       unmapped: redacted.unmapped || %{},
       inserted_at: now
     }
+    |> normalize()
   end
+
+  # Values OCSF allows but the columns can't take as is: coerced here, so
+  # they don't fail the row.
+  #
+  #   * `time` — `:utc_datetime_usec` requires a microsecond precision;
+  #   * IPs — `inet` columns take a tuple: a string is parsed, and one that
+  #     does not parse is dropped (the event is kept).
+  defp normalize(row) do
+    row
+    |> Map.update!(:time, &usec/1)
+    |> Map.update!(:src_endpoint__ip, &ip/1)
+    |> Map.update!(:dst_endpoint__ip, &ip/1)
+  end
+
+  defp usec(%DateTime{microsecond: {us, _precision}} = time), do: %{time | microsecond: {us, 6}}
+  defp usec(time), do: time
+
+  defp ip(ip) when is_binary(ip) do
+    case :inet.parse_address(String.to_charlist(ip)) do
+      {:ok, address} -> address
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp ip(ip), do: ip
 
   @doc """
   Returns the `OCSF.Policy` applied to every write.

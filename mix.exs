@@ -21,7 +21,7 @@ defmodule OCSF.Ecto.MixProject do
       test_coverage: [
         # V_n modules are DDL-only; they're exercised end-to-end by
         # `mix ecto.migrate` during the test alias, not by unit tests.
-        ignore_modules: [OCSF.Ecto.Migration.V1, OCSF.Ecto.Migration.V2]
+        ignore_modules: [OCSF.Ecto.Migration.V1, OCSF.Ecto.Migration.V2, OCSF.Ecto.Migration.V3]
       ]
     ]
   end

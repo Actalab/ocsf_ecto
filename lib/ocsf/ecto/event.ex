@@ -55,7 +55,7 @@ defmodule OCSF.Ecto.Event do
     field :metadata__uid, :binary_id
     field :metadata__version, :string
     field :metadata__product__name, :string
-    field :metadata__correlation_uid, :binary_id
+    field :metadata__correlation_uid, :string
     field :metadata__trace_uid, :string
     field :metadata__span_uid, :string
     field :metadata__event_code, :string
@@ -71,7 +71,7 @@ defmodule OCSF.Ecto.Event do
     field :auth_protocol_id, :integer
 
     # user (PII encrypted)
-    field :user__uid, :binary_id
+    field :user__uid, :string
     field :user__name, EncryptedString
     field :user__email_addr, EncryptedString
     field :user__org__uid, :string
