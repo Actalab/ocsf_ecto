@@ -32,7 +32,7 @@ data classes) and policy-driven redaction applied before insert.
 def deps do
   [
     {:ocsf, "~> 0.2"},
-    {:ocsf_ecto, "~> 0.1"}
+    {:ocsf_ecto, "~> 0.2"}
   ]
 end
 ```
@@ -148,8 +148,8 @@ When a new OCSF schema version lands, create a new migration file
 pinning the version:
 
 ```elixir
-def up,   do: OCSF.Ecto.Migration.up(version: 2)
-def down, do: OCSF.Ecto.Migration.down(version: 2)
+def up,   do: OCSF.Ecto.Migration.up(version: 3)
+def down, do: OCSF.Ecto.Migration.down(version: 3)
 ```
 
 | Version | Change                                                                 |
