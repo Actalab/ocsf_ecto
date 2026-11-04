@@ -48,7 +48,7 @@ defmodule OCSF.Ecto.Migration do
   undoes its own `up/1` and nothing more.
   """
 
-  alias OCSF.Ecto.Migration.{V1, V2}
+  alias OCSF.Ecto.Migration.{V1, V2, V3}
 
   @type opts :: [
           version: :current | pos_integer,
@@ -57,7 +57,7 @@ defmodule OCSF.Ecto.Migration do
           schema: String.t() | nil
         ]
 
-  @versions [V1, V2]
+  @versions [V1, V2, V3]
   @current_version length(@versions)
 
   @default_prefix "ocsf_event__"
@@ -91,7 +91,7 @@ defmodule OCSF.Ecto.Migration do
   ## Examples
 
       iex> OCSF.Ecto.Migration.current_version()
-      2
+      3
   """
   @spec current_version() :: pos_integer
   def current_version, do: @current_version
@@ -102,7 +102,7 @@ defmodule OCSF.Ecto.Migration do
   ## Examples
 
       iex> OCSF.Ecto.Migration.versions()
-      [1, 2]
+      [1, 2, 3]
   """
   @spec versions() :: [pos_integer]
   def versions, do: Enum.to_list(1..@current_version)

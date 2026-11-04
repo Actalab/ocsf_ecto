@@ -66,16 +66,10 @@ defmodule OCSF.Ecto.SinkTelemetryTest do
     # `insert_all/3` raises, as a database that is down does: the Sink's
     # rescue clause converts the raise into `{:error, _}`. (A non-event is
     # no longer one: it is rejected on its own, see SinkResilienceTest.)
-    defmodule DownRepo do
-      def __adapter__, do: Ecto.Adapters.Postgres
-
-      def insert_all(_schema, _rows, _opts),
-        do: raise(DBConnection.ConnectionError, "connection refused")
-    end
 
     setup do
       original = Application.fetch_env(:ocsf_ecto, :repo)
-      Application.put_env(:ocsf_ecto, :repo, DownRepo)
+      Application.put_env(:ocsf_ecto, :repo, OCSF.Ecto.DownRepo)
 
       on_exit(fn ->
         case original do

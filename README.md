@@ -152,6 +152,12 @@ def up,   do: OCSF.Ecto.Migration.up(version: 2)
 def down, do: OCSF.Ecto.Migration.down(version: 2)
 ```
 
+| Version | Change                                                                 |
+|---------|------------------------------------------------------------------------|
+| 1       | `ocsf_event__logs` table and indexes                                   |
+| 2       | completeness columns (`jsonb` sub-objects, lists, `raw_data`)          |
+| 3       | `user__uid`, `metadata__correlation_uid` from `uuid` to `text` (OCSF types them as strings); `down` sets non-UUID values to `NULL` |
+
 Full DDL contract: see SPEC §11. The module is idempotent
 (`create_if_not_exists`) so re-running `up/0` is safe.
 
@@ -256,18 +262,20 @@ a pipeline retrying that batch would never get past it. So
 
 - **coerces** values OCSF allows but the columns can't take: `time`
   padded to microsecond precision, a string IP parsed (dropped if it
-  doesn't parse), a non-UUID `user.uid` / `metadata.correlation_uid`
-  moved to `unmapped` under its OCSF path;
-- **drops** a row that still can't be stored (checked through the
-  adapter's dumpers: a non-UUID `metadata.uid`, a value the column type
-  refuses, an encryption failure), writes the rest, and counts it:
+  doesn't parse);
+- when the batch insert still fails on a row (a non-UUID `metadata.uid`,
+  a value the column type refuses, a `NOT NULL` column left empty, an
+  `unmapped` term JSON can't encode), **retries it one row at a time**,
+  drops the faulty rows, writes the rest, and counts each drop:
 
-| Event                              | Measurements | Metadata                                                        |
-|------------------------------------|--------------|-----------------------------------------------------------------|
-| `[:ocsf_ecto, :sink, :rejected]`   | `%{count}`   | `:sink`, `:reason` (`:invalid_field` \| `:invalid_event`), `:field` |
+| Event                              | Measurements | Metadata                                                                  |
+|------------------------------------|--------------|---------------------------------------------------------------------------|
+| `[:ocsf_ecto, :sink, :rejected]`   | `%{count}`   | `:sink`, `:reason` (`:invalid_row` \| `:invalid_event`), `:error` (exception module) |
 
 `{:error, _}` is left for failures of the write itself (the database
-is down, a timeout), which a retry can fix.
+is down, a timeout, the vault failing), which a retry can fix. Inside
+a caller's transaction the insert runs under a savepoint, so a refused
+row doesn't abort that transaction.
 
 Attach a module-based handler (never an anonymous function — the
 `:telemetry` library warns about performance):
